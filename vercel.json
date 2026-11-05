@@ -1,0 +1,12 @@
+{
+  "crons": [
+    {
+      "path": "/api/ai-cfo/daily-notification",
+      "schedule": "0 9 * * *"
+    },
+    {
+      "path": "/api/ai-cfo/process-notifications",
+      "schedule": "5 9 * * *"
+    }
+  ]
+}
