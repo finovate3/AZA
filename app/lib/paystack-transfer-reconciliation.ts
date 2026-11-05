@@ -179,19 +179,28 @@ if (
         },
       });
 
-      // Calculate the automatic 2% Locked Savings contribution.
-      const savingsContribution = Number(
-        (transferAmount * 0.02).toFixed(2)
-      );
+      // Calculate 2% in kobo to avoid floating-point currency errors.
+const savingsContributionInKobo = Math.round(
+  (amountInKobo * 2) / 100
+);
 
-      let recordedContribution = 0;
+const savingsContribution =
+  savingsContributionInKobo / 100;
 
-      // Only fund Locked Savings if sufficient funds remain.
-      if (
-        savingsContribution > 0 &&
-        Number(accountAfterTransfer.balance) >=
-          savingsContribution
-      ) {
+let recordedContribution = 0;
+
+// Protect funds reserved for other pending transfers.
+const unreservedBalanceAfterTransferInKobo =
+  accountBalanceInKobo -
+  otherPendingInKobo -
+  amountInKobo;
+
+// Only fund Locked Savings from genuinely unreserved funds.
+if (
+  savingsContributionInKobo > 0 &&
+  unreservedBalanceAfterTransferInKobo >=
+    savingsContributionInKobo
+) {
         const savings = await tx.savings.findUnique({
           where: {
             accountId: account.id,

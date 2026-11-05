@@ -1101,7 +1101,10 @@ const [beneficiaryError, setBeneficiaryError] = useState("");
 const [transferFee] = useState(100);
 
   const [pin, setPin] = useState("");
-  const [lastTxRef, setLastTxRef] = useState("");
+const [lastTxRef, setLastTxRef] = useState("");
+
+const [transferAttemptRef, setTransferAttemptRef] = useState("");
+const [isSubmittingTransfer, setIsSubmittingTransfer] = useState(false);
 
   const [transferStatus, setTransferStatus] = useState<
   "PENDING" | "COMPLETED" | "FAILED" | "REVERSED">("PENDING");
@@ -2558,8 +2561,11 @@ const executeReceive = async () => {
     setPin((prev) => prev.slice(0, -1));
   };
 
+
 const handleConfirmSendTransfer = async () => {
   const numericAmount = Number(sendAmount);
+
+  if (isSubmittingTransfer) return;
 
   if (pin.length !== 4) {
     alert("Enter your 4-digit PIN.");
@@ -2596,11 +2602,18 @@ const handleConfirmSendTransfer = async () => {
     return;
   }
 
+  setIsSubmittingTransfer(true);
+
+  // Reuse the same reference if this attempt is retried.
+  const reference =
+    transferAttemptRef || `aza-${crypto.randomUUID()}`;
+
+  if (!transferAttemptRef) {
+    setTransferAttemptRef(reference);
+  }
+
   try {
-    /*
-     * Step 1:
-     * Create/retrieve the Paystack transfer recipient.
-     */
+    // STEP 1: Create or retrieve the Paystack recipient.
     const recipientResponse = await fetch(
       "/api/transfers/recipient",
       {
@@ -2620,33 +2633,16 @@ const handleConfirmSendTransfer = async () => {
 
     const recipientData = await recipientResponse.json();
 
-    if (!recipientResponse.ok) {
-      console.error(
-        "TRANSFER_RECIPIENT_ERROR:",
-        recipientData
-      );
-
+    if (!recipientResponse.ok || !recipientData.recipientCode) {
       alert(
         recipientData.error ||
           "Unable to create the transfer recipient."
       );
-
       return;
     }
 
-    const recipientCode =
-      recipientData.recipientCode;
+    const recipientCode = recipientData.recipientCode;
 
-    if (!recipientCode) {
-      alert(
-        "Paystack did not return a transfer recipient."
-      );
-      return;
-    }
-
-    /*
-     * Save the verified recipient details locally.
-     */
     setSelectedRecipient((prev) => ({
       ...prev,
       name: beneficiaryName,
@@ -2657,78 +2653,146 @@ const handleConfirmSendTransfer = async () => {
       bank: `${selectedBank.name} • ${accountNumber}`,
     }));
 
-    /*
-     * Step 2:
-     * Initiate the actual transfer.
-     *
-     * The backend creates the AZA transaction as PENDING
-     * before calling Paystack.
-     */
-    const transferResponse = await fetch(
-      "/api/transfers",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        credentials: "include",
-        body: JSON.stringify({
-          recipientCode,
-          amount: numericAmount,
-          recipientName: beneficiaryName,
-        }),
+    const transferPayload = {
+      recipientCode,
+      amount: numericAmount,
+      recipientName: beneficiaryName,
+      reference,
+    };
+
+    // STEP 2: Create or retrieve the pending AZA transaction.
+    const reservationResponse = await fetch("/api/transfers", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      credentials: "include",
+      body: JSON.stringify(transferPayload),
+    });
+
+    const reservationData = await reservationResponse.json();
+
+    if (!reservationResponse.ok) {
+      if (reservationData.requiresReconciliation) {
+        setLastTxRef(reference);
       }
-    );
-
-    const transferData =
-      await transferResponse.json();
-
-    if (!transferResponse.ok) {
-      console.error(
-        "TRANSFER_ERROR:",
-        transferData
-      );
 
       alert(
-        transferData.error ||
-          "Unable to initiate the transfer."
+        reservationData.error ||
+          "Unable to prepare this transfer."
       );
-
       return;
     }
 
-    /*
-     * Paystack has accepted the transfer for processing.
-     * Final settlement comes from our webhook.
-     */
-    const newReference =
-      transferData.transaction?.reference ||
-      transferData.reference;
+    const confirmedReference =
+      reservationData.transaction?.reference ||
+      reservationData.reference ||
+      reference;
 
-    if (newReference) {
-      setLastTxRef(newReference);
+    setLastTxRef(confirmedReference);
+
+    // A security review means the transfer has NOT been submitted.
+    if (reservationData.requiresReview) {
+      alert(
+        reservationData.message ||
+          "This transfer requires additional security review."
+      );
+      return;
     }
 
-    setPin("");
+    // STEP 3: Verify the PIN against this exact transaction.
+    if (reservationData.requiresPin) {
+      const pinResponse = await fetch(
+        "/api/security/transaction-pin/verify",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          credentials: "include",
+          body: JSON.stringify({
+            reference: confirmedReference,
+            pin,
+          }),
+        }
+      );
 
-    /*
-     * Keep the current balance unchanged here.
-     * Our webhook is responsible for the authoritative
-     * balance deduction after transfer.success.
-     */
+      const pinData = await pinResponse.json();
+
+      if (!pinResponse.ok || !pinData.success) {
+        alert(
+          pinData.error ||
+            "PIN verification failed. Please try again."
+        );
+        return;
+      }
+    }
+
+    // STEP 4: Submit the SAME transaction reference to Paystack.
+    const submissionResponse = await fetch("/api/transfers", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      credentials: "include",
+      body: JSON.stringify({
+        ...transferPayload,
+        reference: confirmedReference,
+      }),
+    });
+
+    const submissionData = await submissionResponse.json();
+
+    if (!submissionResponse.ok) {
+      if (submissionData.requiresReconciliation) {
+        setLastTxRef(confirmedReference);
+
+        alert(
+          "Your transfer may already have reached processing. Do not create another transfer. Its status must be reconciled."
+        );
+        return;
+      }
+
+      alert(
+        submissionData.error ||
+          "The transfer could not be submitted."
+      );
+      return;
+    }
+
+    if (submissionData.requiresReview) {
+      alert(
+        submissionData.message ||
+          "This transfer requires additional security review."
+      );
+      return;
+    }
+
+    const finalReference =
+      submissionData.transaction?.reference ||
+      submissionData.reference ||
+      confirmedReference;
+
+    setLastTxRef(finalReference);
     setTransferStatus("PENDING");
+    setPin("");
     setFlowState("send_success");
+
+    // Keep the reference until this attempt is finished.
   } catch (error) {
-    console.error(
-      "SEND_TRANSFER_ERROR:",
-      error
-    );
+    console.error("SEND_TRANSFER_ERROR:", error);
+
+    setLastTxRef(reference);
 
     alert(
-      "We couldn't start the transfer right now. Please try again."
+      "We could not confirm the transfer response. Do not start another transfer. Keep this reference for reconciliation: " +
+        reference
     );
+  } finally {
+    setIsSubmittingTransfer(false);
   }
 };
+
 
   return (
     <main className="min-h-screen bg-[#111111] text-zinc-900 flex justify-center items-center p-0 md:p-4 font-sans">
@@ -3570,11 +3634,11 @@ const handleConfirmSendTransfer = async () => {
                 </button>
               <button
                 type="button"
-                disabled={pin.length !== 4}
+                disabled={pin.length !== 4 || isSubmittingTransfer}
                 onClick={handleConfirmSendTransfer}
                 className="w-full py-4 rounded-2xl bg-[#FF6B00] text-white font-bold text-sm shadow-lg shadow-orange-500/30 disabled:opacity-40"
               >
-                Confirm Transfer
+                {isSubmittingTransfer ? "Processing..." : "Confirm Transfer"}
               </button>
               </div>
             </div>
